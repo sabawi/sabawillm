@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced text generator for fine-tuned GPT-2 model with system prompts,
-context management, multiple response options, and post-processing
+context management, multiple response options, post-processing, and special token handling
 """
 
 import argparse
@@ -14,6 +14,68 @@ from datetime import datetime
 from transformers import GPT2LMHeadModel, GPT2Tokenizer, TextIteratorStreamer
 from threading import Thread
 import time
+
+DEFAULT_SPECIAL_TOKENS = {
+    # Basic structural tags
+    "section_open": "<section>",
+    "section_close": "</section>",
+    "question_open": "<question>",
+    "question_close": "</question>",
+    "answer_open": "<answer>",
+    "answer_close": "</answer>",
+    "context_open": "<context>",
+    "context_close": "</context>",
+    "dialog_open": "<dialog>",
+    "dialog_close": "</dialog>",
+    # Additional tags for specialized datasets
+    "instruction_open": "<instruction>",
+    "instruction_close": "</instruction>",
+    "document_open": "<document>",
+    "document_close": "</document>",
+    "text_open": "<text>",
+    "text_close": "</text>",
+    # Story and fiction tags
+    "story_open": "<story>",
+    "story_close": "</story>",
+    "fiction_open": "<fiction>",
+    "fiction_close": "</fiction>",
+    # Title tags
+    "title_open": "<title>",
+    "title_close": "</title>",
+    "think_opne": "<think>",
+    "think_close": "</think>",
+    # Miscellaneous tags
+    "note_open": "<note>",
+    "note_close": "</note>",
+    "warning_open": "<warning>",
+    "warning_close": "</warning>",
+    "error_open": "<error>",
+    "error_close": "</error>",
+    "hint_open": "<hint>",
+    "hint_close": "</hint>",
+    "document_title_open": "<document_title>",
+    "document_title_close": "</document_title>",
+    "paragraph_open": "<paragraph>",
+    "paragraph_close": "</paragraph>",
+    "list_open": "<list>",
+    "list_close": "</list>",
+    "item_open": "<item>",
+    "item_close": "</item>",
+    "link_open": "<link>",
+    "link_close": "</link>",
+    "code_open": "<code>",
+    "code_close": "</code>",
+    "quote_open": "<quote>",
+    "quote_close": "</quote>",
+    "example_open": "<example>",
+    "example_close": "</example>",
+    "question_id_open": "<question_id>",
+    "question_id_close": "</question_id>",
+    "document_id_open": "<document_id>",
+    "document_id_close": "</document_id>",
+    "metadata_open": "<metadata>",
+    "metadata_close": "</metadata>"
+}
 
 class GPT2Generator:
     def __init__(self, model_path="./gpt2-finetuned"):
@@ -41,10 +103,8 @@ class GPT2Generator:
         self.model = GPT2LMHeadModel.from_pretrained(model_path, local_files_only=True)
         self.model.to(self.device)
         
-        # Set pad token
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-            self.model.resize_token_embeddings(len(self.tokenizer))
+        # Check and ensure all special tokens are properly loaded
+        self._ensure_special_tokens()
         
         # Default context
         self.conversation_history = []
@@ -53,6 +113,52 @@ class GPT2Generator:
         
         # Debug mode
         self.debug = False
+
+    def _ensure_special_tokens(self):
+        """
+        Ensure all special tokens are in the tokenizer
+        If they were properly added during fine-tuning, they should already be there
+        """
+        # Set pad token if not present
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            self.model.resize_token_embeddings(len(self.tokenizer))
+        
+        # Check if all XML tags are in the tokenizer's vocabulary
+        special_tokens_list = list(DEFAULT_SPECIAL_TOKENS.values())
+        missing_tokens = [token for token in special_tokens_list 
+                          if token not in self.tokenizer.get_vocab()]
+        
+        # Add any missing special tokens
+        if missing_tokens:
+            print(f"Adding {len(missing_tokens)} missing special tokens to the tokenizer")
+            self.tokenizer.add_special_tokens({"additional_special_tokens": missing_tokens})
+            self.model.resize_token_embeddings(len(self.tokenizer))
+        else:
+            print("All special tokens are already in the tokenizer vocabulary")
+
+    def _preprocess_text_with_tags(self, text):
+        """
+        Preprocess text with XML tags to ensure consistent formatting
+        
+        Args:
+            text: Raw text that may contain XML tags
+            
+        Returns:
+            Preprocessed text with consistent tag spacing
+        """
+        # Fix spacing around tags (no space inside tags, space outside)
+        text = re.sub(r'<([/\w]+)>\s+', r'<\1> ', text)  # Add space after closing tag
+        text = re.sub(r'\s+<([/\w]+)>', r' <\1>', text)  # Add space before opening tag
+        text = re.sub(r'\s+<([/\w]+)>\s+', r' <\1> ', text)  # Normalize spaces around tags
+        
+        # Fix common tag format issues
+        text = re.sub(r'<\s+([/\w]+)\s+>', r'<\1>', text)  # Remove spaces inside tags
+        
+        # Ensure consistent newlines
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        
+        return text.strip()
 
     def _truncate_input_for_context(self, text, context_length):
         """
@@ -88,27 +194,18 @@ class GPT2Generator:
         
         return truncated_text
 
+    # 3. Modified _prepare_input_with_context to ensure better formatting
     def _prepare_input_with_context(self, system_prompt, context, prompt, context_length=512):
         """
-        Prepare the input text with system prompt, context, and user prompt
-        with current prompt prioritized over history
-        
-        Args:
-            system_prompt: Instructions for the model
-            context: Previous conversation or additional context
-            prompt: The current user prompt
-            context_length: Maximum number of tokens to include in context
-            
-        Returns:
-            Combined input text
+        Prepare the input text with properly formatted XML tags
         """
         # First, tokenize the essential parts to know how much space they'll take
-        current_prompt = f"User: {prompt}\nAI:"
+        current_prompt = f"<question>{prompt}</question>\n<answer>"
         current_prompt_tokens = len(self.tokenizer.encode(current_prompt))
         
         system_prompt_tokens = 0
         if system_prompt:
-            system_prompt_text = f"System: {system_prompt}"
+            system_prompt_text = f"<instruction>{system_prompt}</instruction>"
             system_prompt_tokens = len(self.tokenizer.encode(system_prompt_text))
         
         # Calculate how much space is left for history
@@ -124,49 +221,14 @@ class GPT2Generator:
         
         # Add explicit context if provided and there's room
         if context and history_budget > 0:
-            context_tokens = self.tokenizer.encode(f"Context: {context}")
+            context_tokens = self.tokenizer.encode(f"<context>{context}</context>")
             if len(context_tokens) <= history_budget:
-                components.append(f"Context: {context}")
+                components.append(f"<context>{context}</context>")
                 history_budget -= len(context_tokens)
             elif history_budget > 20:  # Only add truncated context if there's reasonable space
-                truncated_context = self._truncate_input_for_context(f"Context: {context}", history_budget)
+                truncated_context = self._truncate_input_for_context(f"<context>{context}</context>", history_budget)
                 components.append(truncated_context)
                 history_budget = 0
-        
-        # Prepare conversation history with sliding window if needed
-        if self.conversation_history and history_budget > 0:
-            # We'll add conversation history items until we approach the limit
-            history_items = []
-            history_header = "Previous conversation:"
-            history_header_tokens = len(self.tokenizer.encode(history_header))
-            
-            # Adjust budget for the header
-            if history_budget > history_header_tokens:
-                history_budget -= history_header_tokens
-            else:
-                history_budget = 0
-            
-            # Start from most recent and work backwards, but SKIP the current prompt if it's there
-            skip_count = 0
-            
-            # Check if the most recent items in history match the current prompt
-            if len(self.conversation_history) >= 1 and prompt in self.conversation_history[-1]:
-                skip_count = 1
-            
-            for entry in reversed(self.conversation_history[:-skip_count if skip_count > 0 else None]):
-                entry_tokens = self.tokenizer.encode(entry)
-                
-                # If adding this entry would exceed our budget, stop
-                if len(entry_tokens) > history_budget:
-                    break
-                
-                # Otherwise, add it to our history
-                history_items.insert(0, entry)
-                history_budget -= len(entry_tokens)
-            
-            if history_items:
-                components.append(history_header)
-                components.extend(history_items)
         
         # Always add the current prompt at the end
         components.append(current_prompt)
@@ -177,20 +239,22 @@ class GPT2Generator:
         # Check the token length
         token_length = len(self.tokenizer.encode(formatted_input))
         if token_length > context_length:
-            print(f"Warning: Input exceeds context length ({token_length} > {context_length} tokens). Some context has been dropped to preserve the current prompt.")
+            print(f"Warning: Input exceeds context length ({token_length} > {context_length} tokens). Some context may be truncated.")
         
         if self.debug:
             # Print first and last parts of input to help with debugging
             print("\n--- INPUT PREVIEW ---")
-            print("FIRST 100 CHARS:", formatted_input[:100].replace('\n', '\\n'))
-            print("LAST 100 CHARS:", formatted_input[-100:].replace('\n', '\\n'))
+            print("FORMATTED INPUT:", formatted_input.replace('\n', '\\n'))
+            print("INPUT TOKEN COUNT:", token_length)
             print("-------------------\n")
         
         return formatted_input
 
+
+    # 2. Modified _post_process_response to debug and better handle empty responses
     def _post_process_response(self, text):
         """
-        Clean up and improve the generated response
+        Clean up and improve the generated response with better debugging
         
         Args:
             text: Raw generated text
@@ -198,29 +262,72 @@ class GPT2Generator:
         Returns:
             Processed text
         """
-        # Extract just the AI's response if the format includes prompt
-        if "AI:" in text:
-            response_parts = text.split("AI:", 1)
-            if len(response_parts) > 1:
-                text = response_parts[1].strip()
+        # Debug raw output
+        if self.debug:
+            print("\n--- RAW RESPONSE ---")
+            print(text.replace('\n', '\\n'))
+            print("--------------------")
+        
+        # If empty text, return a placeholder
+        if not text or text.strip() == "":
+            return "[Model generated empty response]"
+        
+        # Extract just the AI's response from within answer tags if present
+        if "</answer>" in text:
+            try:
+                response = re.search(r'<answer>(.*?)</answer>', text, re.DOTALL)
+                if response:
+                    text = response.group(1).strip()
+                    if self.debug:
+                        print("Found content within answer tags")
+            except Exception as e:
+                if self.debug:
+                    print(f"Error extracting answer tag content: {e}")
+        
+        # If no answer tags but the text starts with any XML tag, try to extract meaningful content
+        if text.strip().startswith("<") and not text.strip().startswith("<answer>"):
+            try:
+                # Remove all XML tags
+                clean_text = re.sub(r'<[^>]+>', '', text).strip()
+                if clean_text:
+                    text = clean_text
+                    if self.debug:
+                        print("Extracted content by removing all XML tags")
+            except Exception as e:
+                if self.debug:
+                    print(f"Error cleaning XML tags: {e}")
+        
+        # If still empty after extraction attempts, return a placeholder
+        if not text or text.strip() == "":
+            return "[Model generated content in unexpected format]"
         
         # Remove any trailing incomplete sentences
         sentences = re.split(r'(?<=[.!?])\s+', text)
         if sentences and not any(sentences[-1].endswith(end) for end in ['.', '!', '?']):
             sentences = sentences[:-1]
+            if self.debug:
+                print("Trimmed incomplete sentence")
         
-        # Remove repetitive content (same sentence appearing multiple times)
+        # If no complete sentences were found, return the original text
+        if not sentences:
+            return text
+        
+        # Remove repetitive content
         unique_sentences = []
         for sentence in sentences:
             if sentence not in unique_sentences:
                 unique_sentences.append(sentence)
             else:
+                if len(unique_sentences) > 3 and self.debug:
+                    print("Detected repetition, stopping early")
                 # If we have more than 3 sentences and find repetition, stop processing
                 if len(unique_sentences) > 3:
                     break
         
-        # Find a clean section break if appropriate
+        # Join the sentences back together
         final_text = " ".join(unique_sentences)
+        
+        # Find a clean section break if appropriate
         section_breaks = [
             r'###\s+\d+\.\s+\*\*.*?\*\*',  # Markdown section like "### 1. **Title**"
             r'\d+\.\s+\*\*.*?\*\*',         # Numbered section like "1. **Title**"
@@ -238,9 +345,12 @@ class GPT2Generator:
                     # Only break if we've got a substantial amount of text already
                     if last_complete_section > 250:
                         final_text = final_text[:last_complete_section]
+                        if self.debug:
+                            print(f"Found section break at position {last_complete_section}")
                         break
         
         return final_text.strip()
+
 
     def _safe_generate(self, input_ids, **generation_kwargs):
         """
@@ -303,26 +413,19 @@ class GPT2Generator:
                 traceback.print_exc()
                 return None
 
+    # 4. Modified generate_multiple_responses to better handle debugging and empty responses
     def generate_multiple_responses(self, prompt, system_prompt=None, context=None, num_responses=3, 
-                                   context_length=512, max_length=200, temperature=0.1, top_k=50, top_p=0.95):
+                                context_length=512, max_length=200, temperature=0.1, top_k=50, top_p=0.95):
         """
-        Generate multiple responses for the same prompt
-        
-        Args:
-            prompt: The input text to continue
-            system_prompt: Instructions for the model
-            context: Additional context or history
-            num_responses: Number of different responses to generate
-            context_length: Length of context to consider
-            max_length: Maximum length of the generated text
-            temperature: Controls randomness (higher = more random)
-            top_k: Number of highest probability tokens to consider
-            top_p: Cumulative probability threshold for token selection
-            
-        Returns:
-            List of generated text sequences
+        Generate multiple responses with improved error handling and debugging
         """
         responses = []
+        
+        # Enable debug temporarily for the first generation to diagnose issues
+        old_debug = self.debug
+        if num_responses > 0 and not self.debug:
+            self.debug = True
+            print("Enabling debug mode for first generation to diagnose issues...")
         
         # Ensure context_length isn't too large
         context_length = min(context_length, self.max_context_length)
@@ -332,17 +435,23 @@ class GPT2Generator:
             system_prompt, context, prompt, context_length
         )
         
-        # Print token count for debugging
+        # Print token count
         input_tokens = self.tokenizer.encode(combined_input)
-        print(f"Input token count: {len(input_tokens)}")
+        if self.debug:
+            print(f"Input token count: {len(input_tokens)}")
         
         for i in range(num_responses):
             # Use slightly different parameters for each response to ensure variety
             temp_adjust = temperature * (0.8 + (i * 0.4))  # Vary temperature a bit
             top_p_adjust = min(top_p * (0.9 + (i * 0.1)), 0.99)
             
+            if i > 0:
+                # Return to original debug setting after first generation
+                self.debug = old_debug
+            
             # Encode the prompt
             input_ids = self.tokenizer.encode(combined_input, return_tensors="pt").to(self.device)
+            attention_mask = torch.ones_like(input_ids).to(self.device)  # Explicit attention mask
             input_length = len(input_ids[0])
             
             # Limit max_length to avoid CUDA errors, but ensure it's larger than input length
@@ -350,32 +459,57 @@ class GPT2Generator:
             
             # Generate text with error handling
             with torch.no_grad():
-                outputs = self._safe_generate(
-                    input_ids,
-                    max_length=adjusted_max_length,
-                    temperature=temp_adjust,
-                    top_k=top_k,
-                    top_p=top_p_adjust,
-                    do_sample=True,
-                    repetition_penalty=1.2,
-                    no_repeat_ngram_size=3,
-                    pad_token_id=self.tokenizer.pad_token_id
-                )
-            
-            # If generation failed, add a placeholder
-            if outputs is None:
-                responses.append("[Generation failed due to resource constraints]")
-                continue
-            
-            # Decode the generated text
-            generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            # Extract just the model's response
-            response = generated_text[len(combined_input):].strip()
-            
-            # Post-process the response
-            clean_response = self._post_process_response(response)
-            responses.append(clean_response)
+                try:
+                    outputs = self._safe_generate(
+                        input_ids,
+                        attention_mask=attention_mask,  # Explicitly pass attention mask
+                        max_length=adjusted_max_length,
+                        temperature=temp_adjust,
+                        top_k=top_k,
+                        top_p=top_p_adjust,
+                        do_sample=True,
+                        repetition_penalty=1.2,
+                        no_repeat_ngram_size=3,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id
+                    )
+                    
+                    # If generation failed, add a placeholder
+                    if outputs is None:
+                        responses.append("[Generation failed due to resource constraints]")
+                        continue
+                    
+                    # Decode the generated text - don't skip special tokens for debugging
+                    generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
+                    
+                    # For debugging the first response
+                    if i == 0 and self.debug:
+                        print("\n--- FULL GENERATED TEXT (First 100 chars) ---")
+                        print(generated_text[:100].replace('\n', '\\n'))
+                        print("--- LAST 50 CHARS ---")
+                        print(generated_text[-50:].replace('\n', '\\n'))
+                        
+                    # Extract just the model's response
+                    response = generated_text[len(combined_input):].strip()
+                    
+                    # Post-process the response
+                    clean_response = self._post_process_response(response)
+                    
+                    # If we got an empty response, try to use more of the generated text
+                    if not clean_response or clean_response.startswith("[Model generated"):
+                        if self.debug:
+                            print("Got empty response, trying alternate extraction...")
+                        # Try using the full generated text and clean it
+                        clean_response = self._post_process_response(generated_text)
+                    
+                    responses.append(clean_response)
+                    
+                except Exception as e:
+                    print(f"Error in generate_multiple_responses: {e}")
+                    responses.append(f"[Error during generation: {str(e)[:100]}...]")
+        
+        # Restore original debug setting
+        self.debug = old_debug
         
         return responses
 
@@ -435,7 +569,7 @@ class GPT2Generator:
         # Decode and process the generated text
         generated_texts = []
         for output in outputs:
-            full_text = self.tokenizer.decode(output, skip_special_tokens=True)
+            full_text = self.tokenizer.decode(output, skip_special_tokens=False)
             response = full_text[len(combined_input):].strip()
             clean_response = self._post_process_response(response)
             generated_texts.append(clean_response)
@@ -478,7 +612,8 @@ class GPT2Generator:
         if input_length >= max_length:
             # Use max_new_tokens instead
             generation_kwargs["max_new_tokens"] = 100
-            print(f"Using max_new_tokens={generation_kwargs['max_new_tokens']} because input_length={input_length} >= max_length={max_length}")
+            if self.debug:
+                print(f"Using max_new_tokens={generation_kwargs['max_new_tokens']} because input_length={input_length} >= max_length={max_length}")
         else:
             # Limit max_length to avoid CUDA errors
             adjusted_max_length = max(input_length + 1, min(input_length + max_length, self.max_context_length))
@@ -535,15 +670,19 @@ class GPT2Generator:
         clean_response = self._post_process_response(generated_text)
         
         # Update conversation history
-        self.conversation_history.append(f"User: {prompt}")
-        self.conversation_history.append(f"AI: {clean_response}")
+        question_tag = f"<question>{prompt}</question>"
+        answer_tag = f"<answer>{clean_response}</answer>"
+        self.conversation_history.append(question_tag)
+        self.conversation_history.append(answer_tag)
         
         return combined_input + clean_response
 
     def update_conversation_history(self, user_input, model_response):
-        """Add a conversation exchange to the history"""
-        self.conversation_history.append(f"User: {user_input}")
-        self.conversation_history.append(f"AI: {model_response}")
+        """Add a conversation exchange to the history with XML tags"""
+        question_tag = f"<question>{user_input}</question>"
+        answer_tag = f"<answer>{model_response}</answer>"
+        self.conversation_history.append(question_tag)
+        self.conversation_history.append(answer_tag)
         
         # Check if we need to trim history to prevent it from growing too large
         self._trim_conversation_history()
@@ -708,6 +847,14 @@ def interactive_streaming(generator, args):
         
         print("\n" + "=" * 100 + "\n")
 
+# 1. Fix the tokenizer padding issue in __init__
+def _fix_init(self):
+    # Make sure pad_token is different from eos_token
+    if self.tokenizer.pad_token is None or self.tokenizer.pad_token == self.tokenizer.eos_token:
+        self.tokenizer.pad_token = '[PAD]'
+        # Make sure the model knows about the pad token too
+        self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        print(f"Set pad_token to '{self.tokenizer.pad_token}' (id: {self.tokenizer.pad_token_id})")
 
 def main():
     parser = argparse.ArgumentParser(description="Enhanced text generator using a fine-tuned GPT-2 model")
@@ -718,8 +865,7 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.95, help="Top-p sampling")
     parser.add_argument("--stream", action="store_true", help="Stream the output token by token")
     parser.add_argument("--system_prompt", type=str, 
-                        default="You are a helpful, knowledgeable assistant that provides accurate and detailed information without repetition.",
-                        help="System instructions for the model")
+                        default="You are a factual assistant who provides accurate information. Stick to verified facts and clearly separate facts from opinions or speculation and without repetition.", help="System instructions for the model")
     parser.add_argument("--context_length", type=int, default=512, help="Length of context to consider")
     parser.add_argument("--context", type=str, default=None, help="Additional context to provide to the model")
     parser.add_argument("--num_responses", type=int, default=3, help="Number of response options to generate")
