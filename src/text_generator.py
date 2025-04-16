@@ -194,11 +194,59 @@ class GPT2Generator:
         
         return truncated_text
 
-    # 3. Modified _prepare_input_with_context to ensure better formatting
     def _prepare_input_with_context(self, system_prompt, context, prompt, context_length=512):
         """
-        Prepare the input text with properly formatted XML tags
+        Prepare the input text with system prompt, context, and user prompt
+        with improved contextual relevance and topic change detection
+        
+        Args:
+            system_prompt: Instructions for the model
+            context: Previous conversation or additional context
+            prompt: The current user prompt
+            context_length: Maximum number of tokens to include in context
+            
+        Returns:
+            Combined input text
         """
+        # Check if this is a topic change by comparing the current prompt to the previous context
+        is_topic_change = False
+        if self.conversation_history and len(self.conversation_history) >= 2:
+            # Get the last question from history
+            last_question = None
+            for entry in reversed(self.conversation_history):
+                if entry.startswith("<question>"):
+                    last_question = entry.replace("<question>", "").replace("</question>", "").strip()
+                    break
+            
+            if last_question:
+                # Compare topics using simple keyword overlap or question type
+                prompt_words = set(re.sub(r'[^\w\s]', '', prompt.lower()).split())
+                last_words = set(re.sub(r'[^\w\s]', '', last_question.lower()).split())
+                
+                # Check for common words (excluding stopwords)
+                stopwords = {'the', 'a', 'an', 'and', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 
+                            'to', 'for', 'of', 'with', 'by', 'about', 'like', 'from', 'but', 'or', 
+                            'as', 'what', 'when', 'where', 'who', 'why', 'how', 'which', 'than', 'if'}
+                
+                meaningful_prompt_words = prompt_words - stopwords
+                meaningful_last_words = last_words - stopwords
+                
+                # Calculate word overlap
+                if len(meaningful_prompt_words) > 0 and len(meaningful_last_words) > 0:
+                    overlap = len(meaningful_prompt_words.intersection(meaningful_last_words))
+                    # If less than 20% word overlap, consider it a topic change
+                    if overlap / len(meaningful_prompt_words) < 0.2 and overlap / len(meaningful_last_words) < 0.2:
+                        is_topic_change = True
+                
+                # Also check for question type changes (what vs where vs how etc.)
+                prompt_question_words = {'what', 'where', 'when', 'why', 'how', 'who', 'which'}.intersection(prompt_words)
+                last_question_words = {'what', 'where', 'when', 'why', 'how', 'who', 'which'}.intersection(last_words)
+                
+                if prompt_question_words and last_question_words:
+                    if not prompt_question_words.intersection(last_question_words):
+                        # Different question types suggest topic change
+                        is_topic_change = True
+        
         # First, tokenize the essential parts to know how much space they'll take
         current_prompt = f"<question>{prompt}</question>\n<answer>"
         current_prompt_tokens = len(self.tokenizer.encode(current_prompt))
@@ -220,7 +268,7 @@ class GPT2Generator:
             components.append(system_prompt_text)
         
         # Add explicit context if provided and there's room
-        if context and history_budget > 0:
+        if context and history_budget > 0 and not is_topic_change:
             context_tokens = self.tokenizer.encode(f"<context>{context}</context>")
             if len(context_tokens) <= history_budget:
                 components.append(f"<context>{context}</context>")
@@ -230,11 +278,64 @@ class GPT2Generator:
                 components.append(truncated_context)
                 history_budget = 0
         
+        # Prepare conversation history with sliding window if needed
+        if self.conversation_history and history_budget > 0 and not is_topic_change:
+            # We'll add conversation history items until we approach the limit
+            history_items = []
+            history_header = "<dialog>"
+            history_header_tokens = len(self.tokenizer.encode(history_header))
+            history_footer = "</dialog>"
+            history_footer_tokens = len(self.tokenizer.encode(history_footer))
+            
+            # Adjust budget for the header and footer
+            if history_budget > (history_header_tokens + history_footer_tokens):
+                history_budget -= (history_header_tokens + history_footer_tokens)
+            else:
+                history_budget = 0
+            
+            # Start from most recent and work backwards, but SKIP the current prompt if it's there
+            skip_count = 0
+            
+            # Check if the most recent items in history match the current prompt
+            if len(self.conversation_history) >= 1 and prompt in self.conversation_history[-1]:
+                skip_count = 1
+            
+            # Focus on recent and relevant conversation
+            # Limit how far back we go based on relevance
+            max_history_pairs = 2  # Just use the most recent Q&A exchange by default
+            
+            for entry in reversed(self.conversation_history[:-skip_count if skip_count > 0 else None]):
+                entry_tokens = self.tokenizer.encode(entry)
+                
+                # If adding this entry would exceed our budget, stop
+                if len(entry_tokens) > history_budget:
+                    break
+                
+                # Otherwise, add it to our history
+                history_items.insert(0, entry)
+                history_budget -= len(entry_tokens)
+                
+                # Only add a limited amount of history
+                if len(history_items) >= max_history_pairs * 2:  # 2 items per Q&A pair
+                    break
+            
+            if history_items:
+                components.append(history_header)
+                components.extend(history_items)
+                components.append(history_footer)
+        
+        # Topic change indicator - explicitly inform the model that topic has changed
+        if is_topic_change:
+            components.append("<context>New topic: The previous conversation is not relevant to this new question.</context>")
+        
         # Always add the current prompt at the end
         components.append(current_prompt)
         
         # Join all components with newlines between sections
         formatted_input = "\n\n".join(components)
+        
+        # Preprocess to ensure XML tags are properly formatted
+        formatted_input = self._preprocess_text_with_tags(formatted_input)
         
         # Check the token length
         token_length = len(self.tokenizer.encode(formatted_input))
@@ -246,15 +347,23 @@ class GPT2Generator:
             print("\n--- INPUT PREVIEW ---")
             print("FORMATTED INPUT:", formatted_input.replace('\n', '\\n'))
             print("INPUT TOKEN COUNT:", token_length)
+            print("TOPIC CHANGE DETECTED:", is_topic_change)
             print("-------------------\n")
         
         return formatted_input
 
 
+    # Add a clear_context method to allow explicit context clearing
+    def clear_context(self):
+        """Clear just the context while keeping the system prompt"""
+        self.conversation_history = []
+        return "Context cleared. The model will not reference previous conversation."
+
+
     # 2. Modified _post_process_response to debug and better handle empty responses
     def _post_process_response(self, text):
         """
-        Clean up and improve the generated response with better debugging
+        Clean up and improve the generated response with better handling of XML tags
         
         Args:
             text: Raw generated text
@@ -262,7 +371,7 @@ class GPT2Generator:
         Returns:
             Processed text
         """
-        # Debug raw output
+        # Debug raw output if in debug mode
         if self.debug:
             print("\n--- RAW RESPONSE ---")
             print(text.replace('\n', '\\n'))
@@ -272,34 +381,46 @@ class GPT2Generator:
         if not text or text.strip() == "":
             return "[Model generated empty response]"
         
-        # Extract just the AI's response from within answer tags if present
-        if "</answer>" in text:
+        # First, try to extract content from within answer tags
+        if "<answer>" in text:
             try:
-                response = re.search(r'<answer>(.*?)</answer>', text, re.DOTALL)
-                if response:
-                    text = response.group(1).strip()
+                # Extract text between <answer> and the next special tag
+                start_idx = text.find("<answer>") + len("<answer>")
+                
+                # Find the next opening tag after <answer>
+                next_tags = ["<dialog>", "<question>", "<section>", "<context>", 
+                            "<instruction>", "<document>", "<text>", "<story>", 
+                            "<fiction>", "<title>"]
+                
+                end_positions = []
+                for tag in next_tags:
+                    pos = text.find(tag, start_idx)
+                    if pos != -1:
+                        end_positions.append(pos)
+                
+                # Find </answer> tag position
+                answer_end = text.find("</answer>", start_idx)
+                if answer_end != -1:
+                    end_positions.append(answer_end)
+                
+                # If we found any ending position, use the earliest one
+                if end_positions:
+                    end_idx = min(end_positions)
+                    extracted_text = text[start_idx:end_idx].strip()
+                else:
+                    # If no ending tag found, use the rest of the text
+                    extracted_text = text[start_idx:].strip()
+                
+                if extracted_text:
+                    text = extracted_text
                     if self.debug:
-                        print("Found content within answer tags")
+                        print("Extracted content from answer tags")
             except Exception as e:
                 if self.debug:
                     print(f"Error extracting answer tag content: {e}")
         
-        # If no answer tags but the text starts with any XML tag, try to extract meaningful content
-        if text.strip().startswith("<") and not text.strip().startswith("<answer>"):
-            try:
-                # Remove all XML tags
-                clean_text = re.sub(r'<[^>]+>', '', text).strip()
-                if clean_text:
-                    text = clean_text
-                    if self.debug:
-                        print("Extracted content by removing all XML tags")
-            except Exception as e:
-                if self.debug:
-                    print(f"Error cleaning XML tags: {e}")
-        
-        # If still empty after extraction attempts, return a placeholder
-        if not text or text.strip() == "":
-            return "[Model generated content in unexpected format]"
+        # Clean up any remaining XML tags
+        text = re.sub(r'</?[a-z_]+>', '', text).strip()
         
         # Remove any trailing incomplete sentences
         sentences = re.split(r'(?<=[.!?])\s+', text)
@@ -315,42 +436,21 @@ class GPT2Generator:
         # Remove repetitive content
         unique_sentences = []
         for sentence in sentences:
+            if not sentence.strip():
+                continue
             if sentence not in unique_sentences:
                 unique_sentences.append(sentence)
             else:
+                # If we have more than 3 sentences and find repetition, stop processing
                 if len(unique_sentences) > 3 and self.debug:
                     print("Detected repetition, stopping early")
-                # If we have more than 3 sentences and find repetition, stop processing
                 if len(unique_sentences) > 3:
                     break
         
         # Join the sentences back together
         final_text = " ".join(unique_sentences)
         
-        # Find a clean section break if appropriate
-        section_breaks = [
-            r'###\s+\d+\.\s+\*\*.*?\*\*',  # Markdown section like "### 1. **Title**"
-            r'\d+\.\s+\*\*.*?\*\*',         # Numbered section like "1. **Title**"
-            r'\*\*\d+\.\s+.*?\*\*',         # Bold numbered section like "**1. Title**"
-            r'\n\s*\n'                      # Double line break
-        ]
-        
-        # Try to find a good breaking point if the text is long
-        if len(final_text) > 300:
-            for pattern in section_breaks:
-                matches = list(re.finditer(pattern, final_text))
-                if matches and len(matches) > 1:
-                    # Find the latest complete section
-                    last_complete_section = matches[-2].start()
-                    # Only break if we've got a substantial amount of text already
-                    if last_complete_section > 250:
-                        final_text = final_text[:last_complete_section]
-                        if self.debug:
-                            print(f"Found section break at position {last_complete_section}")
-                        break
-        
         return final_text.strip()
-
 
     def _safe_generate(self, input_ids, **generation_kwargs):
         """
@@ -415,17 +515,21 @@ class GPT2Generator:
 
     # 4. Modified generate_multiple_responses to better handle debugging and empty responses
     def generate_multiple_responses(self, prompt, system_prompt=None, context=None, num_responses=3, 
-                                context_length=512, max_length=200, temperature=0.1, top_k=50, top_p=0.95):
+                                context_length=512, max_length=200, temperature=0.1, top_k=50, top_p=0.95, quiet=False):
         """
-        Generate multiple responses with improved error handling and debugging
+        Generate multiple responses with quiet mode support
         """
         responses = []
         
-        # Enable debug temporarily for the first generation to diagnose issues
+        # Enable debug temporarily for the first generation only if not in quiet mode
         old_debug = self.debug
-        if num_responses > 0 and not self.debug:
+        if num_responses > 0 and not self.debug and not quiet:
             self.debug = True
             print("Enabling debug mode for first generation to diagnose issues...")
+        
+        # If in quiet mode, completely disable debug
+        if quiet:
+            self.debug = False
         
         # Ensure context_length isn't too large
         context_length = min(context_length, self.max_context_length)
@@ -435,7 +539,7 @@ class GPT2Generator:
             system_prompt, context, prompt, context_length
         )
         
-        # Print token count
+        # Print token count only if in debug mode
         input_tokens = self.tokenizer.encode(combined_input)
         if self.debug:
             print(f"Input token count: {len(input_tokens)}")
@@ -479,7 +583,7 @@ class GPT2Generator:
                         responses.append("[Generation failed due to resource constraints]")
                         continue
                     
-                    # Decode the generated text - don't skip special tokens for debugging
+                    # Decode the generated text - don't skip special tokens
                     generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
                     
                     # For debugging the first response
@@ -505,13 +609,15 @@ class GPT2Generator:
                     responses.append(clean_response)
                     
                 except Exception as e:
-                    print(f"Error in generate_multiple_responses: {e}")
+                    if not quiet:
+                        print(f"Error in generate_multiple_responses: {e}")
                     responses.append(f"[Error during generation: {str(e)[:100]}...]")
         
         # Restore original debug setting
         self.debug = old_debug
         
         return responses
+
 
     def generate_text(self, prompt, system_prompt=None, context=None, context_length=512,
                      max_length=200, temperature=0.1, top_k=50, top_p=0.95, num_return_sequences=1):
@@ -577,9 +683,9 @@ class GPT2Generator:
         return generated_texts
 
     def generate_streaming_text(self, prompt, system_prompt=None, context=None, context_length=512,
-                               max_length=200, temperature=0.1, top_k=50, top_p=0.95, callback=None):
+                            max_length=200, temperature=0.1, top_k=50, top_p=0.95, callback=None):
         """
-        Generate text in a streaming fashion, yielding tokens as they're generated
+        Generate text in a streaming fashion with proper sentence boundary detection
         
         Args:
             prompt: The input text to continue
@@ -605,18 +711,22 @@ class GPT2Generator:
         
         # Encode the prompt
         input_ids = self.tokenizer.encode(combined_input, return_tensors="pt").to(self.device)
+        attention_mask = torch.ones_like(input_ids).to(self.device)
         input_length = len(input_ids[0])
+        
+        # Adjust streaming length based on user-provided max_length
+        streaming_max_length = min(max_length, max(150, max_length // 2))  
         
         # Check if we need to use max_new_tokens instead of max_length
         generation_kwargs = {}
-        if input_length >= max_length:
-            # Use max_new_tokens instead
-            generation_kwargs["max_new_tokens"] = 100
+        if input_length >= streaming_max_length:
+            # Use max_new_tokens instead with appropriate value
+            generation_kwargs["max_new_tokens"] = min(100, max_length // 4)
             if self.debug:
-                print(f"Using max_new_tokens={generation_kwargs['max_new_tokens']} because input_length={input_length} >= max_length={max_length}")
+                print(f"Using max_new_tokens={generation_kwargs['max_new_tokens']} because input_length={input_length} >= max_length={streaming_max_length}")
         else:
             # Limit max_length to avoid CUDA errors
-            adjusted_max_length = max(input_length + 1, min(input_length + max_length, self.max_context_length))
+            adjusted_max_length = max(input_length + 1, min(input_length + streaming_max_length, self.max_context_length))
             generation_kwargs["max_length"] = adjusted_max_length
         
         # Initialize the streamer
@@ -625,14 +735,16 @@ class GPT2Generator:
         # Add common generation parameters
         generation_kwargs.update({
             "input_ids": input_ids,
+            "attention_mask": attention_mask,
             "temperature": temperature,
             "top_k": top_k,
             "top_p": top_p,
             "do_sample": True,
             "repetition_penalty": 1.2,
-            "no_repeat_ngram_size": 3,
+            "no_repeat_ngram_size": 4,
             "streamer": streamer,
-            "pad_token_id": self.tokenizer.pad_token_id
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id
         })
         
         # Use a try-except block to catch errors in the thread
@@ -648,26 +760,130 @@ class GPT2Generator:
         thread = Thread(target=generate_with_error_handling)
         thread.start()
         
-        # Stream the output
+        # State tracking
         generated_text = ""
         first_token = True
+        accumulated_tokens = ""
+        special_tags = ["</answer>", "</dialog>", "</question>", "</section>", 
+                    "</context>", "</instruction>", "</document>", "</text>", 
+                    "</story>", "</fiction>", "</title>"]
+        
+        # Track sentences and completeness
+        sentence_count = 0
+        max_sentences = min(6, max(3, max_length // 75))
+        sentence_buffer = ""
+        complete_sentences = []
+        stream_ended = False
+        
         try:
             for token in streamer:
-                generated_text += token
-                if callback:
-                    callback(token)
-                else:
-                    if first_token:
-                        first_token = False
-                        print("\nAI: ", end="", flush=True)
+                # Add token to buffer for processing
+                buffer = accumulated_tokens + token
+                
+                # Check for special tags
+                tag_found = False
+                for tag in special_tags:
+                    if tag in buffer:
+                        tag_pos = buffer.find(tag)
+                        text_before_tag = buffer[:tag_pos]
+                        text_before_tag = re.sub(r'<[^/][^>]*>', '', text_before_tag)
                         
-                    print(token, end="", flush=True)
+                        if text_before_tag.strip():
+                            # Add to sentence buffer
+                            sentence_buffer += text_before_tag
+                            
+                            # Display to user
+                            if callback:
+                                callback(text_before_tag)
+                            else:
+                                if first_token:
+                                    first_token = False
+                                    print("\nAI: ", end="", flush=True)
+                                print(text_before_tag, end="", flush=True)
+                        
+                        accumulated_tokens = ""
+                        tag_found = True
+                        stream_ended = True
+                        break
+                
+                if stream_ended:
+                    break
+                    
+                if not tag_found:
+                    # Check for opening tags
+                    if '<' in buffer and '>' in buffer:
+                        # Clean opening tags
+                        clean_buffer = re.sub(r'<[^/][^>]*>', '', buffer)
+                        
+                        if clean_buffer != buffer:
+                            if clean_buffer.strip():
+                                # Add to sentence buffer
+                                sentence_buffer += clean_buffer
+                                
+                                # Display to user
+                                if callback:
+                                    callback(clean_buffer)
+                                else:
+                                    if first_token:
+                                        first_token = False
+                                        print("\nAI: ", end="", flush=True)
+                                    print(clean_buffer, end="", flush=True)
+                            accumulated_tokens = ""
+                        else:
+                            accumulated_tokens = buffer
+                    else:
+                        # Add to sentence buffer and display
+                        sentence_buffer += token
+                        
+                        if callback:
+                            callback(token)
+                        else:
+                            if first_token:
+                                first_token = False
+                                print("\nAI: ", end="", flush=True)
+                            print(token, end="", flush=True)
+                        
+                        accumulated_tokens = ""
+                        
+                        # Check if we've completed a sentence
+                        # Look for sentence-ending punctuation followed by space or end of buffer
+                        if (re.search(r'[.!?](\s|$)', sentence_buffer)):
+                            # We have a complete sentence
+                            complete_sentences.append(sentence_buffer.strip())
+                            generated_text += sentence_buffer
+                            sentence_buffer = ""
+                            sentence_count += 1
+                            
+                            # Check if we've reached the maximum number of sentences
+                            if sentence_count >= max_sentences:
+                                stream_ended = True
+                                break
+                
+                    # Also check for repetition
+                    if len(generated_text) > 100 and sentence_count >= 2:
+                        # Simple check for repetition - look for the same sentence appearing twice
+                        if len(complete_sentences) >= 2:
+                            # Check if the last two sentences are very similar
+                            if complete_sentences[-1] and complete_sentences[-2]:
+                                similarity = _compute_similarity(complete_sentences[-1], complete_sentences[-2])
+                                if similarity > 0.7:  # High similarity threshold
+                                    stream_ended = True
+                                    break
+                
         except Exception as e:
             print(f"\nError in streaming: {e}")
-            generated_text += " [Generation interrupted due to an error]"
         
-        # Post-process the streamed response
-        clean_response = self._post_process_response(generated_text)
+        # Add any remaining sentence buffer to the generated text
+        if sentence_buffer:
+            generated_text += sentence_buffer
+        
+        # Final cleanup of any tags
+        clean_response = re.sub(r'</?[a-z_]+>', '', generated_text).strip()
+        
+        # Ensure complete sentences - check if we end with punctuation
+        if not re.search(r'[.!?]$', clean_response) and sentence_buffer:
+            # Add a period to the end if needed
+            clean_response += "."
         
         # Update conversation history
         question_tag = f"<question>{prompt}</question>"
@@ -676,6 +892,10 @@ class GPT2Generator:
         self.conversation_history.append(answer_tag)
         
         return combined_input + clean_response
+
+
+
+
 
     def update_conversation_history(self, user_input, model_response):
         """Add a conversation exchange to the history with XML tags"""
@@ -703,14 +923,49 @@ class GPT2Generator:
         self.debug = enabled
         return self
 
+    # 1. Fix the tokenizer padding issue in __init__
+    def _fix_init(self):
+        # Make sure pad_token is different from eos_token
+        if self.tokenizer.pad_token is None or self.tokenizer.pad_token == self.tokenizer.eos_token:
+            self.tokenizer.pad_token = '[PAD]'
+            # Make sure the model knows about the pad token too
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
+            print(f"Set pad_token to '{self.tokenizer.pad_token}' (id: {self.tokenizer.pad_token_id})")
 
+
+
+# Helper function to compute sentence similarity
+def _compute_similarity(sentence1, sentence2):
+    """
+    Compute a simple similarity score between two sentences.
+    Returns a value between 0 (completely different) and 1 (identical).
+    """
+    # Convert to lowercase and remove punctuation
+    s1 = re.sub(r'[^\w\s]', '', sentence1.lower())
+    s2 = re.sub(r'[^\w\s]', '', sentence2.lower())
+    
+    # Get word sets
+    words1 = set(s1.split())
+    words2 = set(s2.split())
+    
+    # Calculate Jaccard similarity
+    if not words1 or not words2:
+        return 0
+    
+    intersection = len(words1.intersection(words2))
+    union = len(words1.union(words2))
+    
+    return intersection / union if union > 0 else 0
+
+# Modify the interactive_with_options function to add a 'reset' command
 def interactive_with_options(generator, args):
-    """Interactive mode with multiple response options"""
+    """Interactive mode with multiple response options and improved context handling"""
     print(f"Interactive Mode - Generating {args.num_responses} response options")
-    print("Type 'exit' to quit, 'clear' to start a new conversation, 'debug' to toggle debug mode")
+    print("Type 'exit' to quit, 'clear' to start a new conversation, 'reset' to clear context but keep history, 'debug' to toggle debug mode, 'verbose' to toggle verbose mode")
     
     context = args.context
     system_prompt = args.system_prompt
+    quiet_mode = args.quiet
     
     conversation_log = []
     
@@ -732,13 +987,28 @@ def interactive_with_options(generator, args):
             conversation_log = []
             continue
         
+        if user_input.lower() == "reset":
+            # Clear just the context but keep the conversation history for reference
+            context = None
+            print(generator.clear_context())
+            continue
+        
         if user_input.lower() == "debug":
             generator.debug = not generator.debug
             print(f"Debug mode {'enabled' if generator.debug else 'disabled'}")
             continue
+            
+        if user_input.lower() == "verbose":
+            quiet_mode = not quiet_mode
+            print(f"Verbose mode {'disabled' if quiet_mode else 'enabled'}")
+            continue
         
         # Generate multiple responses
-        print("\nGenerating options...\n")
+        if not quiet_mode:
+            print("\nGenerating options...\n")
+        else:
+            print("\nGenerating...", end="", flush=True)
+            
         responses = generator.generate_multiple_responses(
             prompt=user_input,
             system_prompt=system_prompt,
@@ -748,8 +1018,12 @@ def interactive_with_options(generator, args):
             max_length=args.max_length,
             temperature=args.temperature,
             top_k=args.top_k,
-            top_p=args.top_p
+            top_p=args.top_p,
+            quiet=quiet_mode
         )
+        
+        if quiet_mode:
+            print("\r" + " " * 12 + "\r", end="")  # Clear "Generating..." text
         
         # Display options to user
         for i, resp in enumerate(responses):
@@ -759,9 +1033,13 @@ def interactive_with_options(generator, args):
         
         # Let user choose
         while True:
-            choice = input(f"\nSelect your preferred option (1-{args.num_responses}) or 'n' for new options: ")
+            choice = input(f"\nSelect your preferred option (1-{args.num_responses}), 'n' for new options, 's' to skip, or 'r' to reset context: ")
             if choice.lower() == 'n':
-                print("\nGenerating new options...\n")
+                if not quiet_mode:
+                    print("\nGenerating new options...\n")
+                else:
+                    print("\nGenerating...", end="", flush=True)
+                    
                 responses = generator.generate_multiple_responses(
                     prompt=user_input,
                     system_prompt=system_prompt,
@@ -771,8 +1049,39 @@ def interactive_with_options(generator, args):
                     max_length=args.max_length,
                     temperature=args.temperature,
                     top_k=args.top_k,
-                    top_p=args.top_p
+                    top_p=args.top_p,
+                    quiet=quiet_mode
                 )
+                
+                if quiet_mode:
+                    print("\r" + " " * 12 + "\r", end="")  # Clear "Generating..." text
+                    
+                for i, resp in enumerate(responses):
+                    print(f"\n--- Option {i+1} ---\n")
+                    print(resp)
+                    print("\n" + "-" * 30)
+            elif choice.lower() == 's':
+                print("Skipping this exchange - not added to conversation history.")
+                break
+            elif choice.lower() == 'r':
+                # Reset context mid-exchange
+                context = None
+                print(generator.clear_context())
+                print("Regenerating response with cleared context...")
+                
+                responses = generator.generate_multiple_responses(
+                    prompt=user_input,
+                    system_prompt=system_prompt,
+                    context=None,  # Explicitly pass None to clear context
+                    num_responses=args.num_responses,
+                    context_length=args.context_length,
+                    max_length=args.max_length,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    quiet=quiet_mode
+                )
+                
                 for i, resp in enumerate(responses):
                     print(f"\n--- Option {i+1} ---\n")
                     print(resp)
@@ -784,11 +1093,12 @@ def interactive_with_options(generator, args):
                 # Update conversation history
                 generator.update_conversation_history(user_input, selected_response)
                 
-                # Update context from conversation history
-                history_text = ""
-                for entry in generator.conversation_history[-6:]:  # Last 3 exchanges
-                    history_text += entry + "\n"
-                context = history_text.strip()
+                # Update context from conversation history - but only use the most recent exchange
+                # to prevent context overload and topic drift
+                latest_exchange = ""
+                if len(generator.conversation_history) >= 2:
+                    latest_exchange = "\n".join(generator.conversation_history[-2:])
+                context = latest_exchange
                 
                 # Add to conversation log
                 conversation_log.append({
@@ -801,15 +1111,22 @@ def interactive_with_options(generator, args):
                 print(f"\nYou selected option {int(choice)}. Response added to conversation history.")
                 break
             else:
-                print(f"Please enter a number between 1 and {args.num_responses}, or 'n'.")
+                print(f"Please enter a number between 1 and {args.num_responses}, 'n', 's', or 'r'.")
 
+
+# Also update the streaming interactive mode
 def interactive_streaming(generator, args):
-    """Interactive mode with streaming responses"""
-    print("Interactive Streaming Mode")
-    print("Type 'exit' to quit, 'clear' to start a new conversation, 'debug' to toggle debug mode")
+    """Interactive streaming mode with improved context handling"""
+    print("Interactive Streaming Mode - Direct Response")
+    print("Type 'exit' to quit, 'clear' to start a new conversation, 'reset' to clear context but keep history, 'debug' to toggle debug mode")
     
     context = args.context
     system_prompt = args.system_prompt
+    quiet_mode = args.quiet
+    
+    # Force debug off if quiet mode is on
+    if quiet_mode:
+        generator.debug = False
     
     while True:
         user_input = input("\nEnter a prompt (or 'exit' to quit): ")
@@ -822,13 +1139,28 @@ def interactive_streaming(generator, args):
             print("Conversation history cleared.")
             continue
         
+        if user_input.lower() == "reset":
+            # Clear just the context but keep the conversation history for reference
+            context = None
+            print(generator.clear_context())
+            continue
+        
         if user_input.lower() == "debug":
             generator.debug = not generator.debug
             print(f"Debug mode {'enabled' if generator.debug else 'disabled'}")
             continue
+
+        if user_input.lower() == "verbose":
+            quiet_mode = not quiet_mode
+            generator.debug = not quiet_mode  # Link debug and quiet modes
+            print(f"Verbose mode {'disabled' if quiet_mode else 'enabled'}")
+            continue
         
-        # Generate streaming response
-        generator.generate_streaming_text(
+        # Generate streaming response - pass through the user's max_length parameter
+        if not quiet_mode:
+            print("\nGenerating streaming response...")
+        
+        response = generator.generate_streaming_text(
             prompt=user_input,
             system_prompt=system_prompt,
             context=context,
@@ -839,22 +1171,15 @@ def interactive_streaming(generator, args):
             top_p=args.top_p
         )
         
-        # Update context from conversation history
-        history_text = ""
-        for entry in generator.conversation_history[-6:]:  # Last 3 exchanges
-            history_text += entry + "\n"
-        context = history_text.strip()
+        # Update context but only use the most recent exchange to prevent context drift
+        latest_exchange = ""
+        if len(generator.conversation_history) >= 2:
+            latest_exchange = "\n".join(generator.conversation_history[-2:])
+        context = latest_exchange
         
-        print("\n" + "=" * 100 + "\n")
+        print("\n" + "=" * 50 + "\n")
+        
 
-# 1. Fix the tokenizer padding issue in __init__
-def _fix_init(self):
-    # Make sure pad_token is different from eos_token
-    if self.tokenizer.pad_token is None or self.tokenizer.pad_token == self.tokenizer.eos_token:
-        self.tokenizer.pad_token = '[PAD]'
-        # Make sure the model knows about the pad token too
-        self.model.config.pad_token_id = self.tokenizer.pad_token_id
-        print(f"Set pad_token to '{self.tokenizer.pad_token}' (id: {self.tokenizer.pad_token_id})")
 
 def main():
     parser = argparse.ArgumentParser(description="Enhanced text generator using a fine-tuned GPT-2 model")
@@ -865,28 +1190,29 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.95, help="Top-p sampling")
     parser.add_argument("--stream", action="store_true", help="Stream the output token by token")
     parser.add_argument("--system_prompt", type=str, 
-                        default="You are a factual assistant who provides accurate information. Stick to verified facts and clearly separate facts from opinions or speculation and without repetition.", help="System instructions for the model")
+                    default="You are a factual assistant who provides accurate information. Stick to verified facts and clearly separate facts from opinions or speculation and without repetition.", help="System instructions for the model")
     parser.add_argument("--context_length", type=int, default=512, help="Length of context to consider")
     parser.add_argument("--context", type=str, default=None, help="Additional context to provide to the model")
-    parser.add_argument("--num_responses", type=int, default=3, help="Number of response options to generate")
+    parser.add_argument("--num_responses", type=int, default=3, help="Number of response options to generate (ignored in streaming mode)")
     parser.add_argument("--save_conversations", action="store_true", help="Save conversations to JSON files")
     parser.add_argument("--options", action="store_true", help="Use multiple options mode even with streaming")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode to show input previews")
+    parser.add_argument("--quiet", action="store_true", help="Disable verbose output mode")
     
     args = parser.parse_args()
     print(f"Arguments: {args}")
     
     # Initialize generator
     generator = GPT2Generator(args.model_path)
-    if args.debug:
+    if args.debug and not args.quiet:  # Don't enable debug if quiet mode
         generator.enable_debug(True)
     
-    # Choose interaction mode
-    if args.stream and not args.options and args.num_responses <= 1:
+    # Choose interaction mode - always use direct streaming if --stream is specified
+    # unless --options is explicitly set
+    if args.stream and not args.options:
         interactive_streaming(generator, args)
     else:
-        interactive_with_options(generator, args)
-        
+        interactive_with_options(generator, args)        
 
 if __name__ == "__main__":
     main()
