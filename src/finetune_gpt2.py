@@ -63,7 +63,7 @@ DEFAULT_SPECIAL_TOKENS = {
     # Title tags
     "title_open": "<title>",
     "title_close": "</title>",
-    "think_opne": "<think>",
+    "think_open": "<think>",
     "think_close": "</think>",
     # Miscellaneous tags
     "note_open": "<note>",
@@ -94,6 +94,8 @@ DEFAULT_SPECIAL_TOKENS = {
     "question_id_close": "</question_id>",
     "document_id_open": "<document_id>",
     "document_id_close": "</document_id>",
+    "passage_open": "<passage>",
+    "passage_close": "</passage>",
     "metadata_open": "<metadata>",
     "metadata_close": "</metadata>"
 }

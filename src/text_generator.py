@@ -73,6 +73,8 @@ DEFAULT_SPECIAL_TOKENS = {
     "question_id_close": "</question_id>",
     "document_id_open": "<document_id>",
     "document_id_close": "</document_id>",
+    "passage_open": "<passage>",
+    "passage_close": "</passage>",
     "metadata_open": "<metadata>",
     "metadata_close": "</metadata>"
 }
